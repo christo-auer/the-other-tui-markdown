@@ -3,7 +3,12 @@ name = "the-other-tui-markdown"
 version = "0.1.0"
 edition = "2024"
 description = "Convert Markdown to ratatui Text with configurable theming and per-element rendering"
-license = "MIT"
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/christo-auer/the-other-tui-markdown"
+repository = "https://github.com/christo-auer/the-other-tui-markdown"
+keywords = [ "ratatui", "tui", "markdown" ]
+categories = [ "command-line-utilities" ]
+publish = true
 
 [dependencies]
 pulldown-cmark = { version = "0.13", default-features = false }
