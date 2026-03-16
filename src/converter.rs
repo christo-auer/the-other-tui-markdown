@@ -88,6 +88,9 @@ pub(crate) struct Converter<'r> {
     item_depth: usize,
     /// URL stashed when we enter `Tag::Link`.
     pending_link_url: Option<String>,
+    /// Index into `current_spans` at which the current link's content begins.
+    /// Used to extract only the link's own spans when the link closes.
+    link_span_start: Option<usize>,
     /// Alt text accumulated while inside `Tag::Image`.
     pending_image_alt: Option<String>,
     /// URL stashed when we enter `Tag::Image`.
@@ -108,6 +111,7 @@ impl<'r> Converter<'r> {
             inline_stack: Vec::new(),
             item_depth: 0,
             pending_link_url: None,
+            link_span_start: None,
             pending_image_alt: None,
             pending_image_url: None,
             in_image: false,
@@ -691,6 +695,7 @@ impl<'r> Converter<'r> {
 
             Tag::Link { dest_url, .. } => {
                 self.pending_link_url = Some(dest_url.into_string());
+                self.link_span_start = Some(self.current_spans.len());
                 self.inline_stack.push(self.theme().link);
             }
 
@@ -852,22 +857,17 @@ impl<'r> Converter<'r> {
             TagEnd::Link => {
                 self.inline_stack.pop();
                 let url = self.pending_link_url.take().unwrap_or_default();
-                // Collect the alt-text spans already pushed to current_spans
-                // since Tag::Link opened.
+                // Collect the alt-text spans pushed to current_spans since
+                // Tag::Link opened (not spans from earlier in the same line).
                 if let Some(f) = &self.renderer.link {
-                    // Replace the spans that were pushed during the link content
-                    // with the custom renderer output. The alt text is the
-                    // concatenation of span contents accumulated so far.
-                    let alt: String = self
-                        .current_spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect();
-                    // Clear the inline spans and replace with custom output.
-                    self.current_spans.clear();
+                    let start = self.link_span_start.take().unwrap_or(0);
+                    // Drain only the spans belonging to this link.
+                    let link_spans: Vec<_> = self.current_spans.drain(start..).collect();
+                    let alt: String = link_spans.iter().map(|s| s.content.as_ref()).collect();
                     let new_spans = f(&alt, &url);
                     self.current_spans.extend(new_spans);
                 } else {
+                    self.link_span_start = None;
                     // Default: append `(url)` after the alt text spans.
                     let style = self.theme().link;
                     self.push_span(format!("({})", url), style);
@@ -1308,6 +1308,32 @@ mod tests {
         convert_with("[x](https://test.org)", &renderer);
         CAPTURED.with(|c| received_url = c.borrow().clone());
         assert_eq!(received_url, "https://test.org");
+    }
+
+    #[test]
+    fn multiple_links_in_paragraph_default() {
+        // Regression: second link must not absorb the first link's alt text.
+        let p = plain_text(&convert("[a](l1) foo [b](l2)"));
+        assert!(p.contains("(l1)"), "first url missing: {p}");
+        assert!(p.contains("(l2)"), "second url missing: {p}");
+        // The text between the links must not be absorbed into a link.
+        assert!(p.contains("foo"), "inter-link text missing: {p}");
+    }
+
+    #[test]
+    fn multiple_links_in_paragraph_custom_renderer() {
+        // Regression: with a custom renderer, [a](l1) foo [b](l2) must not
+        // produce alt="a(l1) foo b" for the second link.
+        let renderer = RendererBuilder::new()
+            .with_link(|alt, url| vec![Span::raw(format!("[{alt}]({url})"))])
+            .build();
+        let p = plain_text(&convert_with("[a](l1) foo [b](l2)", &renderer));
+        assert!(p.contains("[a](l1)"), "first link wrong: {p}");
+        assert!(p.contains("[b](l2)"), "second link wrong: {p}");
+        assert!(!p.contains("[a](l1) foo [b](l2)".replace('(', "").as_str()),
+            "alt text must not bleed across links: {p}");
+        // Stricter: the second link's alt must be exactly "b", not "a(l1) foo b".
+        assert!(!p.contains("a(l1)"), "first link content leaked into second: {p}");
     }
 
     // ── Images ────────────────────────────────────────────────────────────────
