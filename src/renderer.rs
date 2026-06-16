@@ -62,6 +62,15 @@ pub type RuleFn = dyn Fn() -> Vec<Line<'static>> + Send + Sync;
 /// Argument: `label` (e.g. `"1"` for `[^1]`).
 pub type FootnoteRefFn = dyn Fn(&str) -> Vec<Span<'static>> + Send + Sync;
 
+/// Renders a table into a sequence of [`Line`]s.
+///
+/// Receives the header row and body rows. Each cell is a [`Vec`] of
+/// [`Span`]s carrying the inline styles already applied by the current
+/// [`Theme`]. The closure may inspect, replace, or re-wrap the spans.
+pub type TableFn = dyn Fn(&[Vec<Span<'static>>], &[Vec<Vec<Span<'static>>>], &Theme) -> Vec<Line<'static>>
+    + Send
+    + Sync;
+
 // ── Renderer ─────────────────────────────────────────────────────────────────
 
 /// Holds the [`Theme`] and all optional per-element custom renderers.
@@ -76,6 +85,7 @@ pub struct Renderer {
     pub(crate) heading: Option<Box<HeadingFn>>,
     pub(crate) rule: Option<Box<RuleFn>>,
     pub(crate) footnote_ref: Option<Box<FootnoteRefFn>>,
+    pub(crate) table: Option<Box<TableFn>>,
 }
 
 impl Renderer {
@@ -101,6 +111,7 @@ pub struct RendererBuilder {
     heading: Option<Box<HeadingFn>>,
     rule: Option<Box<RuleFn>>,
     footnote_ref: Option<Box<FootnoteRefFn>>,
+    table: Option<Box<TableFn>>,
 }
 
 impl Default for RendererBuilder {
@@ -121,6 +132,7 @@ impl RendererBuilder {
             heading: None,
             rule: None,
             footnote_ref: None,
+            table: None,
         }
     }
 
@@ -211,10 +223,7 @@ impl RendererBuilder {
     /// Override thematic-break rendering.
     ///
     /// The closure takes no arguments and must return a `Vec<Line<'static>>`.
-    pub fn with_rule(
-        mut self,
-        f: impl Fn() -> Vec<Line<'static>> + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with_rule(mut self, f: impl Fn() -> Vec<Line<'static>> + Send + Sync + 'static) -> Self {
         self.rule = Some(Box::new(f));
         self
     }
@@ -231,6 +240,22 @@ impl RendererBuilder {
         self
     }
 
+    /// Override table rendering. Receives `(header, rows, theme)`.
+    ///
+    /// `header` and each row are `Vec`s of cells; each cell is a `Vec` of
+    /// [`Span`]s with inline styles already applied. The default renderer pads
+    /// each cell to the computed column width and joins columns with ` │ `.
+    pub fn with_table(
+        mut self,
+        f: impl Fn(&[Vec<Span<'static>>], &[Vec<Vec<Span<'static>>>], &Theme) -> Vec<Line<'static>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.table = Some(Box::new(f));
+        self
+    }
+
     /// Consume the builder and produce a [`Renderer`].
     pub fn build(self) -> Renderer {
         Renderer {
@@ -242,6 +267,7 @@ impl RendererBuilder {
             heading: self.heading,
             rule: self.rule,
             footnote_ref: self.footnote_ref,
+            table: self.table,
         }
     }
 }
@@ -295,9 +321,7 @@ mod tests {
     #[test]
     fn builder_with_code_block_stores_closure() {
         let r = RendererBuilder::new()
-            .with_code_block(|lang, content| {
-                vec![Line::raw(format!("{lang}: {content}"))]
-            })
+            .with_code_block(|lang, content| vec![Line::raw(format!("{lang}: {content}"))])
             .build();
         let lines = r.code_block.as_ref().unwrap()("rust", "fn main() {}");
         assert_eq!(lines[0].spans[0].content, "rust: fn main() {}");
@@ -335,5 +359,35 @@ mod tests {
     fn builder_default_impl_same_as_new() {
         let r = RendererBuilder::default().build();
         assert!(r.link.is_none());
+    }
+
+    #[test]
+    fn builder_with_table_stores_closure() {
+        let renderer = RendererBuilder::new()
+            .with_table(|header, rows, _theme| {
+                let mut lines = Vec::new();
+                for h in header {
+                    let content: String = h.iter().map(|s| s.content.as_ref()).collect();
+                    lines.push(Line::raw(format!("H:{content}")));
+                }
+                for row in rows {
+                    for cell in row {
+                        let content: String = cell.iter().map(|s| s.content.as_ref()).collect();
+                        lines.push(Line::raw(format!("C:{content}")));
+                    }
+                }
+                lines
+            })
+            .build();
+        assert!(renderer.table.is_some());
+        let header: Vec<Vec<Span<'static>>> = vec![vec![Span::raw("Name")], vec![Span::raw("Age")]];
+        let rows: Vec<Vec<Vec<Span<'static>>>> =
+            vec![vec![vec![Span::raw("Alice")], vec![Span::raw("30")]]];
+        let lines = renderer.table.as_ref().unwrap()(&header, &rows, &crate::Theme::default());
+        assert_eq!(lines.len(), 4, "should have 2 header + 2 body cells");
+        assert_eq!(lines[0].spans[0].content, "H:Name");
+        assert_eq!(lines[1].spans[0].content, "H:Age");
+        assert_eq!(lines[2].spans[0].content, "C:Alice");
+        assert_eq!(lines[3].spans[0].content, "C:30");
     }
 }

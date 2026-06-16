@@ -90,8 +90,7 @@ struct App {
 impl App {
     fn new() -> Self {
         // Forward map built during rendering: url → hint number.
-        let url_to_hint: Arc<Mutex<HashMap<String, u32>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let url_to_hint: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
         let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         let url_map = Arc::clone(&url_to_hint);
@@ -100,9 +99,9 @@ impl App {
         let renderer = RendererBuilder::new()
             .with_link(move |alt, url| {
                 let mut map = url_map.lock().unwrap();
-                let n = *map.entry(url.to_owned()).or_insert_with(|| {
-                    ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                });
+                let n = *map
+                    .entry(url.to_owned())
+                    .or_insert_with(|| ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
                 vec![
                     Span::styled(
                         format!("[{}]", alt),
@@ -112,9 +111,7 @@ impl App {
                     ),
                     Span::styled(
                         format!("({})", n),
-                        Style::new()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
+                        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     ),
                 ]
             })
@@ -212,7 +209,10 @@ fn main() -> io::Result<()> {
                     format!(" {} links found", hint_count),
                     Style::new().fg(Color::DarkGray),
                 ),
-                Span::styled(input_display, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    input_display,
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(opened_display, Style::new().fg(Color::Green)),
             ]);
             let status_para = Paragraph::new(status);

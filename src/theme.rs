@@ -126,21 +126,13 @@ impl Default for Theme {
                 .add_modifier(Modifier::ITALIC),
 
             // Block quotes.
-            block_quote: Style::new()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::ITALIC),
-            block_quote_note: Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::ITALIC),
-            block_quote_tip: Style::new()
-                .fg(Color::Green)
-                .add_modifier(Modifier::ITALIC),
+            block_quote: Style::new().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+            block_quote_note: Style::new().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+            block_quote_tip: Style::new().fg(Color::Green).add_modifier(Modifier::ITALIC),
             block_quote_warning: Style::new()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::ITALIC),
-            block_quote_caution: Style::new()
-                .fg(Color::Red)
-                .add_modifier(Modifier::ITALIC),
+            block_quote_caution: Style::new().fg(Color::Red).add_modifier(Modifier::ITALIC),
             block_quote_important: Style::new()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::ITALIC),
@@ -155,9 +147,7 @@ impl Default for Theme {
 
             // Misc.
             rule: Style::new().fg(Color::DarkGray),
-            footnote_ref: Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            footnote_ref: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
             footnote_def: Style::new().fg(Color::DarkGray),
             math: Style::new().fg(Color::Yellow),
             html: Style::new().fg(Color::DarkGray),

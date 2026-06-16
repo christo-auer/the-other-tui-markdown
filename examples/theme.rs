@@ -158,8 +158,7 @@ fn main() -> io::Result<()> {
             frame.render_widget(left_block, cols[0]);
 
             let default_text = the_other_tui_markdown::into_text(MARKDOWN);
-            let left_para = Paragraph::new(default_text)
-                .wrap(Wrap { trim: false });
+            let left_para = Paragraph::new(default_text).wrap(Wrap { trim: false });
             frame.render_widget(left_para, left_inner);
 
             // Right column: ocean theme.
@@ -170,8 +169,7 @@ fn main() -> io::Result<()> {
             let right_inner = right_block.inner(cols[1]);
             frame.render_widget(right_block, cols[1]);
 
-            let right_para = Paragraph::new(text.clone())
-                .wrap(Wrap { trim: false });
+            let right_para = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
             frame.render_widget(right_para, right_inner);
         })?;
 

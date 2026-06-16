@@ -102,7 +102,7 @@ pub mod theme;
 
 pub use renderer::{
     CodeBlockFn, FootnoteRefFn, HeadingFn, ImageFn, InlineCodeFn, LinkFn, Renderer,
-    RendererBuilder, RuleFn,
+    RendererBuilder, RuleFn, TableFn,
 };
 pub use theme::Theme;
 
