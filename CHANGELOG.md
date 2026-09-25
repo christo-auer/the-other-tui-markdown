@@ -1,5 +1,7 @@
 # Unreleased
 
+# 0.2.0 - 2026-09-25
+
 - Add mouse/hit-testing support: `into_document*` functions return a
   `MarkdownDocument` pairing the rendered `Text` with per-span element
   annotations. `MarkdownDocument::element_at` maps Text-space coordinates and
