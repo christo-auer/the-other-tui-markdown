@@ -9,6 +9,10 @@ use ratatui_core::text::{Line, Span, Text};
 use unicode_width::UnicodeWidthStr;
 
 use crate::Renderer;
+use crate::document::{Element, ElementId, ElementKind, MarkdownDocument, SpanRange};
+
+/// The root element (kind [`ElementKind::Document`]) at arena index 0.
+const ROOT_ELEMENT: ElementId = ElementId(0);
 
 // ── Block context stack ───────────────────────────────────────────────────────
 
@@ -70,6 +74,8 @@ impl TableBuf {
 struct FootnoteDef {
     label: String,
     content: String,
+    /// The element created for this footnote definition.
+    element: ElementId,
 }
 
 // ── Converter ────────────────────────────────────────────────────────────────
@@ -99,6 +105,19 @@ pub(crate) struct Converter<'r> {
     in_image: bool,
     /// Footnote definitions collected during the parse (rendered at the end).
     footnote_defs: Vec<FootnoteDef>,
+    // ── Hit-test annotation state ─────────────────────────────────────────────
+    /// Arena of all elements encountered so far (indexed by [`ElementId`]).
+    elements: Vec<Element>,
+    /// Stack of currently open elements (innermost last). Never empty.
+    element_stack: Vec<ElementId>,
+    /// Per-line span annotations, parallel to `lines`.
+    line_annotations: Vec<Vec<SpanRange>>,
+    /// Ranges accumulating for the line currently being built.
+    current_ranges: Vec<SpanRange>,
+    /// Display-cell column the next span of the current line starts at.
+    current_col: u16,
+    /// Display-cell column at which the current link's content begins.
+    link_col_start: Option<u16>,
 }
 
 impl<'r> Converter<'r> {
@@ -116,6 +135,15 @@ impl<'r> Converter<'r> {
             pending_image_url: None,
             in_image: false,
             footnote_defs: Vec::new(),
+            elements: vec![Element {
+                kind: ElementKind::Document,
+                parent: None,
+            }],
+            element_stack: vec![ROOT_ELEMENT],
+            line_annotations: Vec::new(),
+            current_ranges: Vec::new(),
+            current_col: 0,
+            link_col_start: None,
         }
     }
 
@@ -194,21 +222,115 @@ impl<'r> Converter<'r> {
         "  ".repeat(self.item_depth.saturating_sub(1))
     }
 
+    // ── Element stack ─────────────────────────────────────────────────────────
+
+    /// The innermost open element (or the root).
+    fn current_element(&self) -> ElementId {
+        *self.element_stack.last().unwrap_or(&ROOT_ELEMENT)
+    }
+
+    /// Open a new element as a child of the current one and return its id.
+    fn push_element(&mut self, kind: ElementKind) -> ElementId {
+        let parent = match self.element_stack.last() {
+            Some(&id) if id != ROOT_ELEMENT => Some(id),
+            _ => None,
+        };
+        let id = ElementId(self.elements.len() as u32);
+        self.elements.push(Element { kind, parent });
+        self.element_stack.push(id);
+        id
+    }
+
+    /// Close the innermost element (keeping the root).
+    fn pop_element(&mut self) {
+        if self.element_stack.len() > 1 {
+            self.element_stack.pop();
+        }
+    }
+
+    /// Mutate the kind of the innermost element (e.g. to fill in link alt
+    /// text once the closing tag is reached).
+    fn patch_current_element(&mut self, f: impl FnOnce(&mut ElementKind)) {
+        let id = self.current_element();
+        f(&mut self.elements[id.0 as usize].kind);
+    }
+
+    // ── Span/line emission with hit-test annotation ───────────────────────────
+
+    /// Append a span to the current line and record its column range.
+    fn emit_span(&mut self, span: Span<'static>) {
+        let width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
+        if width > 0 {
+            let start = self.current_col;
+            let end = start.saturating_add(width);
+            self.current_ranges.push(SpanRange {
+                start,
+                end,
+                element: self.current_element(),
+            });
+            self.current_col = end;
+        }
+        self.current_spans.push(span);
+    }
+
     fn push_span(&mut self, content: impl Into<String>, style: Style) {
         let content = content.into();
         if !content.is_empty() {
-            self.current_spans.push(Span::styled(content, style));
+            self.emit_span(Span::styled(content, style));
         }
     }
 
     fn commit_line(&mut self) {
         let spans = std::mem::take(&mut self.current_spans);
         self.lines.push(Line::from(spans));
+        let ranges = std::mem::take(&mut self.current_ranges);
+        self.line_annotations.push(ranges);
+        self.current_col = 0;
+    }
+
+    fn push_blank_line(&mut self) {
+        self.lines.push(Line::default());
+        self.line_annotations.push(Vec::new());
     }
 
     fn commit_line_and_blank(&mut self) {
         self.commit_line();
-        self.lines.push(Line::default());
+        self.push_blank_line();
+    }
+
+    /// Take the accumulated current spans (to hand to a custom renderer),
+    /// discarding their ranges — the lines built from them are re-annotated
+    /// when appended via [`Self::extend_annotated_lines`].
+    fn take_current_spans(&mut self) -> Vec<Span<'static>> {
+        self.current_ranges.clear();
+        self.current_col = 0;
+        std::mem::take(&mut self.current_spans)
+    }
+
+    /// Append an already-built line, annotating every span with `element`.
+    fn push_annotated_line(&mut self, line: Line<'static>, element: ElementId) {
+        let mut col = 0u16;
+        let mut ranges = Vec::new();
+        for span in &line.spans {
+            let width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
+            if width > 0 {
+                ranges.push(SpanRange {
+                    start: col,
+                    end: col + width,
+                    element,
+                });
+                col += width;
+            }
+        }
+        self.lines.push(line);
+        self.line_annotations.push(ranges);
+    }
+
+    /// Append already-built lines, annotating every span with `element`.
+    fn extend_annotated_lines(&mut self, lines: Vec<Line<'static>>, element: ElementId) {
+        for line in lines {
+            self.push_annotated_line(line, element);
+        }
     }
 
     /// True if the innermost block context should swallow text silently.
@@ -243,15 +365,29 @@ impl<'r> Converter<'r> {
 
     // ── Table rendering ───────────────────────────────────────────────────────
 
-    fn render_table(buf: &TableBuf, theme: &crate::Theme) -> Vec<Line<'static>> {
+    /// Create a [`ElementKind::TableCell`] element under the given table.
+    fn new_table_cell(&mut self, table: ElementId, row: u16, col: u16, header: bool) -> ElementId {
+        let id = ElementId(self.elements.len() as u32);
+        self.elements.push(Element {
+            kind: ElementKind::TableCell { row, col, header },
+            parent: Some(table),
+        });
+        id
+    }
+
+    /// Render the buffered table, annotating header/body cells with
+    /// [`ElementKind::TableCell`] and separators with the table element.
+    fn render_table(&mut self, buf: &TableBuf, table: ElementId) {
         let ncols = buf
             .header
             .len()
             .max(buf.rows.iter().map(|r| r.len()).max().unwrap_or(0));
 
         if ncols == 0 {
-            return Vec::new();
+            return;
         }
+
+        let theme = self.renderer.theme();
 
         // Compute column widths (display width).
         let mut col_widths: Vec<usize> = (0..ncols)
@@ -269,49 +405,60 @@ impl<'r> Converter<'r> {
             *w = (*w).max(1);
         }
 
-        let mut out: Vec<Line<'static>> = Vec::new();
-
         // Header row.
-        {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            for (i, w) in col_widths.iter().enumerate() {
-                if i > 0 {
-                    spans.push(Span::styled(" │ ", theme.table_separator));
-                }
-                let cell = buf.header.get(i).map(|s| s.as_str()).unwrap_or("");
-                let padded = pad_cell(cell, *w);
-                spans.push(Span::styled(padded, theme.table_header));
-            }
-            out.push(Line::from(spans));
-        }
+        let header_cells: Vec<(String, Style, ElementId)> = (0..ncols)
+            .map(|i| {
+                let cell = buf.header.get(i).cloned().unwrap_or_default();
+                let el = self.new_table_cell(table, 0, i as u16, true);
+                (cell, theme.table_header, el)
+            })
+            .collect();
+        let (line, ranges) = build_table_row(&header_cells, &col_widths, theme.table_separator, table);
+        self.lines.push(line);
+        self.line_annotations.push(ranges);
 
         // Separator row: ─────┼───── for each column.
         {
             let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut ranges: Vec<SpanRange> = Vec::new();
+            let mut col = 0u16;
             for (i, w) in col_widths.iter().enumerate() {
                 if i > 0 {
                     spans.push(Span::styled("─┼─", theme.table_separator));
+                    ranges.push(SpanRange {
+                        start: col,
+                        end: col + 3,
+                        element: table,
+                    });
+                    col += 3;
                 }
-                spans.push(Span::styled("─".repeat(*w), theme.table_separator));
+                let w = *w as u16;
+                spans.push(Span::styled("─".repeat(w as usize), theme.table_separator));
+                ranges.push(SpanRange {
+                    start: col,
+                    end: col + w,
+                    element: table,
+                });
+                col += w;
             }
-            out.push(Line::from(spans));
+            self.lines.push(Line::from(spans));
+            self.line_annotations.push(ranges);
         }
 
         // Body rows.
-        for row in &buf.rows {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            for (i, w) in col_widths.iter().enumerate() {
-                if i > 0 {
-                    spans.push(Span::styled(" │ ", theme.table_separator));
-                }
-                let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                let padded = pad_cell(cell, *w);
-                spans.push(Span::styled(padded, theme.table_cell));
-            }
-            out.push(Line::from(spans));
+        for (r, row) in buf.rows.iter().enumerate() {
+            let cells: Vec<(String, Style, ElementId)> = (0..ncols)
+                .map(|i| {
+                    let cell = row.get(i).cloned().unwrap_or_default();
+                    let el = self.new_table_cell(table, (r + 1) as u16, i as u16, false);
+                    (cell, theme.table_cell, el)
+                })
+                .collect();
+            let (line, ranges) =
+                build_table_row(&cells, &col_widths, theme.table_separator, table);
+            self.lines.push(line);
+            self.line_annotations.push(ranges);
         }
-
-        out
     }
 
     // ── Item marker ───────────────────────────────────────────────────────────
@@ -362,11 +509,11 @@ impl<'r> Converter<'r> {
         if self.footnote_defs.is_empty() {
             return;
         }
-        self.lines.push(Line::default());
-        self.lines.push(Line::from(Span::styled(
-            "─".repeat(40),
-            self.theme().rule,
-        )));
+        self.push_blank_line();
+        let rule_id = self.push_element(ElementKind::Rule);
+        let rule_line = Line::from(Span::styled("─".repeat(40), self.theme().rule));
+        self.push_annotated_line(rule_line, rule_id);
+        self.pop_element();
         let defs = std::mem::take(&mut self.footnote_defs);
         for def in &defs {
             let label_span = Span::styled(
@@ -374,13 +521,13 @@ impl<'r> Converter<'r> {
                 self.theme().footnote_def,
             );
             let content_span = Span::styled(def.content.clone(), self.theme().footnote_def);
-            self.lines.push(Line::from(vec![label_span, content_span]));
+            self.push_annotated_line(Line::from(vec![label_span, content_span]), def.element);
         }
     }
 
     // ── Main convert entry-point ──────────────────────────────────────────────
 
-    pub(crate) fn convert(&mut self, markdown: &str) -> Text<'static> {
+    pub(crate) fn convert(&mut self, markdown: &str) -> MarkdownDocument {
         let options = Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TABLES
             | Options::ENABLE_GFM
@@ -408,11 +555,16 @@ impl<'r> Converter<'r> {
         // Remove trailing blank line.
         if self.lines.last().map_or(false, |l| l.spans.is_empty()) {
             self.lines.pop();
+            self.line_annotations.pop();
         }
 
         let mut text = Text::from(std::mem::take(&mut self.lines));
         text.style = self.theme().base;
-        text
+        MarkdownDocument::from_parts(
+            text,
+            std::mem::take(&mut self.elements),
+            std::mem::take(&mut self.line_annotations),
+        )
     }
 
     // ── Event dispatch ────────────────────────────────────────────────────────
@@ -464,6 +616,7 @@ impl<'r> Converter<'r> {
                 if self.is_metadata() || self.is_table_context() {
                     return;
                 }
+                self.push_element(ElementKind::InlineCode);
                 let code_str = code.into_string();
                 // Custom inline_code renderer?
                 let spans = if let Some(f) = &self.renderer.inline_code {
@@ -473,17 +626,13 @@ impl<'r> Converter<'r> {
                     vec![Span::styled(code_str, style)]
                 };
                 for span in spans {
-                    self.current_spans.push(span);
+                    self.emit_span(span);
                 }
+                self.pop_element();
             }
 
-            Event::InlineMath(math) | Event::DisplayMath(math) => {
-                if self.is_metadata() {
-                    return;
-                }
-                let style = self.current_style().patch(self.theme().math);
-                self.push_span(math.into_string(), style);
-            }
+            Event::InlineMath(math) => self.handle_math(math.into_string(), false),
+            Event::DisplayMath(math) => self.handle_math(math.into_string(), true),
 
             Event::SoftBreak => {
                 if self.is_metadata() || self.in_image || self.is_table_context() {
@@ -513,14 +662,17 @@ impl<'r> Converter<'r> {
                         Line::from(Span::styled("─".repeat(40), self.theme().rule)),
                     ]
                 };
-                self.lines.extend(lines);
-                self.lines.push(Line::default());
+                let rule = self.push_element(ElementKind::Rule);
+                self.extend_annotated_lines(lines, rule);
+                self.pop_element();
+                self.push_blank_line();
             }
 
             Event::Html(html) | Event::InlineHtml(html) => {
                 if self.is_metadata() {
                     return;
                 }
+                self.push_element(ElementKind::Html);
                 let style = self.theme().html;
                 let s = html.into_string();
                 let mut iter = s.split('\n').peekable();
@@ -530,11 +682,21 @@ impl<'r> Converter<'r> {
                         self.commit_line();
                     }
                 }
+                self.pop_element();
             }
 
             Event::TaskListMarker(checked) => {
                 if self.is_metadata() {
                     return;
+                }
+                // Record the checkbox state on the enclosing list item.
+                for &id in self.element_stack.iter().rev() {
+                    if let ElementKind::ListItem { checked: c } =
+                        &mut self.elements[id.0 as usize].kind
+                    {
+                        *c = Some(checked);
+                        break;
+                    }
                 }
                 let marker = if checked { "[x] " } else { "[ ] " };
                 self.push_span(marker, self.current_style());
@@ -542,6 +704,9 @@ impl<'r> Converter<'r> {
 
             Event::FootnoteReference(label) => {
                 let label = label.into_string();
+                self.push_element(ElementKind::FootnoteRef {
+                    label: label.clone(),
+                });
                 let spans = if let Some(f) = &self.renderer.footnote_ref {
                     f(&label)
                 } else {
@@ -551,11 +716,24 @@ impl<'r> Converter<'r> {
                     )]
                 };
                 for span in spans {
-                    self.current_spans.push(span);
+                    self.emit_span(span);
                 }
+                self.pop_element();
             }
 
         }
+    }
+
+    // ── Inline math ───────────────────────────────────────────────────────────
+
+    fn handle_math(&mut self, math: String, display: bool) {
+        if self.is_metadata() {
+            return;
+        }
+        self.push_element(ElementKind::Math { display });
+        let style = self.current_style().patch(self.theme().math);
+        self.push_span(math, style);
+        self.pop_element();
     }
 
     // ── Code block helpers ────────────────────────────────────────────────────
@@ -584,10 +762,14 @@ impl<'r> Converter<'r> {
         match tag {
             Tag::Paragraph => {
                 self.block_stack.push(BlockCtx::Paragraph);
+                self.push_element(ElementKind::Paragraph);
             }
 
             Tag::Heading { level, .. } => {
                 self.block_stack.push(BlockCtx::Heading(level));
+                self.push_element(ElementKind::Heading {
+                    level: Self::heading_level_u8(level),
+                });
                 // If there's no custom heading renderer, push the prefix span immediately.
                 if self.renderer.heading.is_none() {
                     let style = self.heading_style(level);
@@ -597,6 +779,9 @@ impl<'r> Converter<'r> {
 
             Tag::BlockQuote(kind) => {
                 self.block_stack.push(BlockCtx::BlockQuote(kind));
+                self.push_element(ElementKind::BlockQuote {
+                    kind: kind.map(crate::QuoteKind::from),
+                });
                 let style = self.blockquote_style(kind);
                 self.push_span("▌ ", style);
             }
@@ -606,6 +791,9 @@ impl<'r> Converter<'r> {
                     CodeBlockKind::Fenced(l) => l.trim().to_owned(),
                     CodeBlockKind::Indented => String::new(),
                 };
+                self.push_element(ElementKind::CodeBlock {
+                    lang: if lang.is_empty() { None } else { Some(lang.clone()) },
+                });
                 self.block_stack.push(BlockCtx::CodeBlock {
                     lang,
                     content: String::new(),
@@ -618,6 +806,9 @@ impl<'r> Converter<'r> {
                 if !self.current_spans.is_empty() {
                     self.commit_line();
                 }
+                self.push_element(ElementKind::List {
+                    ordered: start.is_some(),
+                });
                 let ctx = if let Some(n) = start {
                     BlockCtx::OrderedList(n)
                 } else {
@@ -629,6 +820,7 @@ impl<'r> Converter<'r> {
             Tag::Item => {
                 self.item_depth += 1;
                 self.block_stack.push(BlockCtx::Item);
+                self.push_element(ElementKind::ListItem { checked: None });
                 let indent = self.list_indent();
                 let marker = self.make_item_marker();
                 let style = self.theme().list_marker;
@@ -638,6 +830,7 @@ impl<'r> Converter<'r> {
 
             Tag::Table(_) => {
                 self.block_stack.push(BlockCtx::Table(TableBuf::new()));
+                self.push_element(ElementKind::Table);
             }
             Tag::TableHead => {
                 // Mark the table buffer as being in the header.
@@ -658,23 +851,30 @@ impl<'r> Converter<'r> {
 
             Tag::FootnoteDefinition(label) => {
                 let label = label.into_string();
+                let element = self.push_element(ElementKind::FootnoteDef {
+                    label: label.clone(),
+                });
                 self.footnote_defs.push(FootnoteDef {
                     label: label.clone(),
                     content: String::new(),
+                    element,
                 });
                 self.block_stack.push(BlockCtx::FootnoteDef(label));
             }
 
             Tag::DefinitionList => {
                 self.block_stack.push(BlockCtx::DefinitionList);
+                self.push_element(ElementKind::DefinitionList);
             }
             Tag::DefinitionListTitle => {
                 self.block_stack.push(BlockCtx::DefinitionListTitle);
+                self.push_element(ElementKind::DefinitionTitle);
                 // Render title as bold.
                 self.inline_stack.push(self.theme().strong);
             }
             Tag::DefinitionListDefinition => {
                 self.block_stack.push(BlockCtx::DefinitionListDefinition);
+                self.push_element(ElementKind::Definition);
                 self.push_span("  ", Style::default());
             }
 
@@ -684,23 +884,50 @@ impl<'r> Converter<'r> {
 
             Tag::HtmlBlock => {
                 self.block_stack.push(BlockCtx::HtmlBlock);
+                self.push_element(ElementKind::Html);
             }
 
             // Inline tags.
-            Tag::Emphasis => self.inline_stack.push(self.theme().emphasis),
-            Tag::Strong => self.inline_stack.push(self.theme().strong),
-            Tag::Strikethrough => self.inline_stack.push(self.theme().strikethrough),
-            Tag::Superscript => self.inline_stack.push(self.theme().superscript),
-            Tag::Subscript => self.inline_stack.push(self.theme().subscript),
+            Tag::Emphasis => {
+                self.inline_stack.push(self.theme().emphasis);
+                self.push_element(ElementKind::Emphasis);
+            }
+            Tag::Strong => {
+                self.inline_stack.push(self.theme().strong);
+                self.push_element(ElementKind::Strong);
+            }
+            Tag::Strikethrough => {
+                self.inline_stack.push(self.theme().strikethrough);
+                self.push_element(ElementKind::Strikethrough);
+            }
+            Tag::Superscript => {
+                self.inline_stack.push(self.theme().superscript);
+                self.push_element(ElementKind::Superscript);
+            }
+            Tag::Subscript => {
+                self.inline_stack.push(self.theme().subscript);
+                self.push_element(ElementKind::Subscript);
+            }
 
             Tag::Link { dest_url, .. } => {
-                self.pending_link_url = Some(dest_url.into_string());
+                let url = dest_url.into_string();
+                self.push_element(ElementKind::Link {
+                    alt: String::new(),
+                    url: url.clone(),
+                });
+                self.pending_link_url = Some(url);
                 self.link_span_start = Some(self.current_spans.len());
+                self.link_col_start = Some(self.current_col);
                 self.inline_stack.push(self.theme().link);
             }
 
             Tag::Image { dest_url, .. } => {
-                self.pending_image_url = Some(dest_url.into_string());
+                let url = dest_url.into_string();
+                self.push_element(ElementKind::Image {
+                    alt: String::new(),
+                    url: url.clone(),
+                });
+                self.pending_image_url = Some(url);
                 self.pending_image_alt = Some(String::new());
                 self.in_image = true;
                 // Don't push to inline_stack yet; we render everything in End.
@@ -714,6 +941,7 @@ impl<'r> Converter<'r> {
         match tag {
             TagEnd::Paragraph => {
                 self.block_stack.pop();
+                self.pop_element();
                 self.commit_line_and_blank();
             }
 
@@ -721,17 +949,20 @@ impl<'r> Converter<'r> {
                 self.block_stack.pop();
                 if let Some(f) = &self.renderer.heading {
                     // Hand the accumulated spans to the custom renderer.
-                    let spans = std::mem::take(&mut self.current_spans);
+                    let spans = self.take_current_spans();
+                    let heading = self.current_element();
                     let lines = f(Self::heading_level_u8(level), spans);
-                    self.lines.extend(lines);
-                    self.lines.push(Line::default());
+                    self.extend_annotated_lines(lines, heading);
+                    self.push_blank_line();
                 } else {
                     self.commit_line_and_blank();
                 }
+                self.pop_element();
             }
 
             TagEnd::BlockQuote(_) => {
                 self.block_stack.pop();
+                self.pop_element();
                 if !self.current_spans.is_empty() {
                     self.commit_line_and_blank();
                 }
@@ -741,26 +972,30 @@ impl<'r> Converter<'r> {
                 // Pop and extract the buffered CodeBlock context.
                 let ctx = self.block_stack.pop();
                 if let Some(BlockCtx::CodeBlock { lang, content }) = ctx {
+                    let code_block = self.current_element();
                     let lines = if let Some(f) = &self.renderer.code_block {
                         f(&lang, &content)
                     } else {
                         Self::default_code_block_lines(&lang, &content, self.renderer.theme())
                     };
-                    self.lines.extend(lines);
-                    self.lines.push(Line::default());
+                    self.extend_annotated_lines(lines, code_block);
+                    self.push_blank_line();
                 }
+                self.pop_element();
             }
 
             TagEnd::List(_) => {
                 self.block_stack.pop();
+                self.pop_element();
                 // Blank line after the outermost list.
                 if !self.block_stack.iter().any(|b| matches!(b, BlockCtx::Item)) {
-                    self.lines.push(Line::default());
+                    self.push_blank_line();
                 }
             }
 
             TagEnd::Item => {
                 self.block_stack.pop();
+                self.pop_element();
                 self.item_depth = self.item_depth.saturating_sub(1);
                 if !self.current_spans.is_empty() {
                     self.commit_line();
@@ -769,11 +1004,11 @@ impl<'r> Converter<'r> {
 
             TagEnd::Table => {
                 let ctx = self.block_stack.pop();
+                let table = self.current_element();
+                self.pop_element();
                 if let Some(BlockCtx::Table(buf)) = ctx {
-                    let theme = self.renderer.theme();
-                    let lines = Self::render_table(&buf, theme);
-                    self.lines.extend(lines);
-                    self.lines.push(Line::default());
+                    self.render_table(&buf, table);
+                    self.push_blank_line();
                 }
             }
             TagEnd::TableHead => {
@@ -818,19 +1053,23 @@ impl<'r> Converter<'r> {
 
             TagEnd::FootnoteDefinition => {
                 self.block_stack.pop();
+                self.pop_element();
             }
 
             TagEnd::DefinitionList => {
                 self.block_stack.pop();
-                self.lines.push(Line::default());
+                self.pop_element();
+                self.push_blank_line();
             }
             TagEnd::DefinitionListTitle => {
                 self.block_stack.pop();
+                self.pop_element();
                 self.inline_stack.pop();
                 self.commit_line();
             }
             TagEnd::DefinitionListDefinition => {
                 self.block_stack.pop();
+                self.pop_element();
                 self.commit_line();
             }
 
@@ -840,6 +1079,7 @@ impl<'r> Converter<'r> {
 
             TagEnd::HtmlBlock => {
                 self.block_stack.pop();
+                self.pop_element();
                 if !self.current_spans.is_empty() {
                     self.commit_line();
                 }
@@ -852,11 +1092,13 @@ impl<'r> Converter<'r> {
             | TagEnd::Superscript
             | TagEnd::Subscript => {
                 self.inline_stack.pop();
+                self.pop_element();
             }
 
             TagEnd::Link => {
                 self.inline_stack.pop();
                 let url = self.pending_link_url.take().unwrap_or_default();
+                let col_start = self.link_col_start.take().unwrap_or(0);
                 // Collect the alt-text spans pushed to current_spans since
                 // Tag::Link opened (not spans from earlier in the same line).
                 if let Some(f) = &self.renderer.link {
@@ -864,20 +1106,51 @@ impl<'r> Converter<'r> {
                     // Drain only the spans belonging to this link.
                     let link_spans: Vec<_> = self.current_spans.drain(start..).collect();
                     let alt: String = link_spans.iter().map(|s| s.content.as_ref()).collect();
+                    self.patch_current_element(|kind| {
+                        if let ElementKind::Link { alt: a, .. } = kind {
+                            *a = alt.clone();
+                        }
+                    });
+                    // Drop the drained spans' ranges; the replacement spans
+                    // are re-annotated below.
+                    let first_dropped = self
+                        .current_ranges
+                        .iter()
+                        .position(|r| r.start >= col_start)
+                        .unwrap_or(self.current_ranges.len());
+                    self.current_ranges.truncate(first_dropped);
+                    self.current_col = col_start;
                     let new_spans = f(&alt, &url);
-                    self.current_spans.extend(new_spans);
+                    for span in new_spans {
+                        self.emit_span(span);
+                    }
                 } else {
-                    self.link_span_start = None;
+                    let start = self.link_span_start.take().unwrap_or(0);
+                    let alt: String = self.current_spans[start..]
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect();
+                    self.patch_current_element(|kind| {
+                        if let ElementKind::Link { alt: a, .. } = kind {
+                            *a = alt;
+                        }
+                    });
                     // Default: append `(url)` after the alt text spans.
                     let style = self.theme().link;
                     self.push_span(format!("({})", url), style);
                 }
+                self.pop_element();
             }
 
             TagEnd::Image => {
                 self.in_image = false;
                 let alt = self.pending_image_alt.take().unwrap_or_default();
                 let url = self.pending_image_url.take().unwrap_or_default();
+                self.patch_current_element(|kind| {
+                    if let ElementKind::Image { alt: a, .. } = kind {
+                        *a = alt.clone();
+                    }
+                });
                 let spans = if let Some(f) = &self.renderer.image {
                     f(&alt, &url)
                 } else {
@@ -885,8 +1158,9 @@ impl<'r> Converter<'r> {
                     vec![Span::styled(format!("🖼 {}({})", alt, url), style)]
                 };
                 for span in spans {
-                    self.current_spans.push(span);
+                    self.emit_span(span);
                 }
+                self.pop_element();
             }
         }
     }
@@ -942,6 +1216,44 @@ impl<'r> Converter<'r> {
     }
 }
 
+// ── Table row building ────────────────────────────────────────────────────────
+
+/// Build one table row line (cells padded to `col_widths`, joined with
+/// `" │ "`) together with its span annotations: cells are tagged with their
+/// [`ElementKind::TableCell`] element, separators with the table element.
+fn build_table_row(
+    cells: &[(String, Style, ElementId)],
+    col_widths: &[usize],
+    sep_style: Style,
+    table: ElementId,
+) -> (Line<'static>, Vec<SpanRange>) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut ranges: Vec<SpanRange> = Vec::new();
+    let mut col = 0u16;
+    for (i, w) in col_widths.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" │ ", sep_style));
+            ranges.push(SpanRange {
+                start: col,
+                end: col + 3,
+                element: table,
+            });
+            col += 3;
+        }
+        let (text, style, el) = &cells[i];
+        let padded = pad_cell(text, *w);
+        let w = *w as u16;
+        spans.push(Span::styled(padded, *style));
+        ranges.push(SpanRange {
+            start: col,
+            end: col + w,
+            element: *el,
+        });
+        col += w;
+    }
+    (Line::from(spans), ranges)
+}
+
 // ── Padding helper ────────────────────────────────────────────────────────────
 
 /// Pad `s` with trailing spaces until its display width equals `width`.
@@ -990,7 +1302,7 @@ mod tests {
 
     fn convert_with(md: &str, renderer: &Renderer) -> Text<'static> {
         let mut c = Converter::new(renderer);
-        c.convert(md)
+        c.convert(md).into_text()
     }
 
     // ── Paragraphs ────────────────────────────────────────────────────────────

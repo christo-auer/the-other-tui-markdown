@@ -1292,6 +1292,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "ratatui-core",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

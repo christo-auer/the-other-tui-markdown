@@ -72,6 +72,37 @@
 //! // `hints` now maps "https://docs.rs" → 1, "https://crates.io" → 2.
 //! ```
 //!
+//! # Mouse support (hit-testing)
+//!
+//! The `into_document*` family works exactly like `into_text*`, but returns a
+//! [`MarkdownDocument`] that remembers which Markdown element produced every
+//! span. Given a mouse event's screen coordinates you can then ask what is
+//! under the cursor:
+//!
+//! ```rust
+//! use the_other_tui_markdown::{ElementKind, ParagraphView, into_document};
+//! use ratatui_core::layout::Rect;
+//!
+//! let doc = into_document("Click [a link](https://example.com)!");
+//!
+//! // Describe how the `Paragraph` renders the text (area, scroll, wrap):
+//! let view = ParagraphView::new(Rect::new(0, 0, 40, 10)).wrap(true);
+//!
+//! // A left click at screen (row 0, column 7):
+//! let hit = doc.element_at_screen(0, 7, &view).expect("hit");
+//! assert!(matches!(&hit.kind, ElementKind::Link { url, .. } if url == "https://example.com"));
+//! ```
+//!
+//! [`MarkdownDocument::element_at_screen`] accounts for the widget area,
+//! vertical/horizontal scroll, word wrapping (`Wrap { trim }`), and text
+//! alignment. [`MarkdownDocument::element_at`] is the simpler Text-space
+//! variant (line index + display column) when no wrapping is involved. Each
+//! hit also links to its enclosing elements via
+//! [`MarkdownDocument::ancestors_of`], so you can tell e.g. that a link sits
+//! inside a list item inside a block quote.
+//!
+//! See `examples/mouse.rs` for a complete interactive demo.
+//!
 //! # Supported Markdown elements
 //!
 //! | Element | Default output |
@@ -97,9 +128,14 @@
 //! | Definition lists | term in bold, definition indented |
 
 pub mod converter;
+pub mod document;
 pub mod renderer;
 pub mod theme;
+mod wrap;
 
+pub use document::{
+    Element, ElementId, ElementKind, MarkdownDocument, ParagraphView, QuoteKind,
+};
 pub use renderer::{
     CodeBlockFn, FootnoteRefFn, HeadingFn, ImageFn, InlineCodeFn, LinkFn, Renderer,
     RendererBuilder, RuleFn,
@@ -122,8 +158,7 @@ use ratatui_core::text::Text;
 /// assert!(!text.lines.is_empty());
 /// ```
 pub fn into_text(markdown: &str) -> Text<'static> {
-    let renderer = RendererBuilder::new().build();
-    into_text_with_renderer(markdown, &renderer)
+    into_document(markdown).into_text()
 }
 
 /// Convert Markdown to [`Text`] using the default [`Theme`] and a custom
@@ -144,8 +179,7 @@ pub fn into_text(markdown: &str) -> Text<'static> {
 /// let text = into_text_with_theme("# Red heading", theme);
 /// ```
 pub fn into_text_with_theme(markdown: &str, theme: Theme) -> Text<'static> {
-    let renderer = RendererBuilder::new().with_theme(theme).build();
-    into_text_with_renderer(markdown, &renderer)
+    into_document_with_theme(markdown, theme).into_text()
 }
 
 /// Convert Markdown to [`Text`] using a fully configured [`Renderer`].
@@ -164,6 +198,41 @@ pub fn into_text_with_theme(markdown: &str, theme: Theme) -> Text<'static> {
 /// assert!(!text.lines.is_empty());
 /// ```
 pub fn into_text_with_renderer(markdown: &str, renderer: &Renderer) -> Text<'static> {
+    into_document_with_renderer(markdown, renderer).into_text()
+}
+
+/// Convert Markdown to a [`MarkdownDocument`] using the default [`Theme`] and
+/// no custom element renderers.
+///
+/// A [`MarkdownDocument`] contains the rendered [`Text`] plus the element
+/// annotations needed for hit-testing (see
+/// [`MarkdownDocument::element_at_screen`]).
+///
+/// ```rust
+/// use the_other_tui_markdown::{ElementKind, into_document};
+///
+/// let doc = into_document("A [link](https://example.com).");
+/// let hit = doc.element_at(0, 2).expect("hit");
+/// assert!(matches!(hit.kind, ElementKind::Link { .. }));
+/// ```
+pub fn into_document(markdown: &str) -> MarkdownDocument {
+    let renderer = RendererBuilder::new().build();
+    into_document_with_renderer(markdown, &renderer)
+}
+
+/// Convert Markdown to a [`MarkdownDocument`] using a custom [`Theme`].
+pub fn into_document_with_theme(markdown: &str, theme: Theme) -> MarkdownDocument {
+    let renderer = RendererBuilder::new().with_theme(theme).build();
+    into_document_with_renderer(markdown, &renderer)
+}
+
+/// Convert Markdown to a [`MarkdownDocument`] using a fully configured
+/// [`Renderer`].
+///
+/// Spans and lines produced by custom `with_*` renderers are annotated with
+/// the element they were invoked for, so hit-testing keeps working with
+/// custom rendering (e.g. links replaced by hint numbers stay clickable).
+pub fn into_document_with_renderer(markdown: &str, renderer: &Renderer) -> MarkdownDocument {
     let mut conv = converter::Converter::new(renderer);
     conv.convert(markdown)
 }

@@ -13,6 +13,7 @@ publish = true
 [dependencies]
 pulldown-cmark = { version = "0.13", default-features = false }
 ratatui-core = "0.1"
+unicode-segmentation = "1"
 unicode-width = "0.2"
 
 [dev-dependencies]
